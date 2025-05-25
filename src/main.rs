@@ -9,11 +9,28 @@ use std::process::{Command, Stdio};
 
 // --- External Crate Imports ---
 use chrono::Local;
+use clap::Parser; // For parsing command-line arguments
 use home;
 use quote::ToTokens;
 use serde::Deserialize;
 use syn;
 use toml;
+
+// --- CLI Argument Definitions ---
+
+/// A Rust developer tool to provide source code context with compiler errors,
+/// especially from third-party crates, across various feature flag combinations.
+#[derive(clap::Parser, Debug)] // Use fully qualified path for the derive macro
+#[clap(author, version, about, long_about = None)]
+struct CliArgs {
+    /// Comma-separated list of specific crate features to focus the analysis on.
+    /// If provided, `getdoc` runs in "Targeted Mode", checking combinations
+    /// relevant to these features within the current environment.
+    /// If omitted, `getdoc` runs in "Comprehensive Mode", checking a broader
+    /// set of feature combinations (default, no-default, all-features, etc.).
+    #[clap(long, value_parser, value_delimiter = ',')]
+    features: Option<Vec<String>>,
+}
 
 // --- Struct Definitions ---
 
@@ -83,11 +100,28 @@ struct ExtractedItem {
 // --- Main Function ---
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("[getdoc] Starting analysis for multiple feature sets...");
+    // Parse command-line arguments
+    let cli_args = CliArgs::parse();
 
-    let feature_sets_to_check = get_feature_sets_to_check().unwrap_or_else(|e| {
-        eprintln!("[getdoc] Warning: Could not determine feature sets from Cargo.toml: {}. Proceeding with default check only.", e);
-        vec![vec![]]
+    // Determine the mode of operation based on CLI arguments
+    if cli_args.features.is_some() {
+        println!("[getdoc] Starting analysis in Targeted Mode for specified features...");
+    } else {
+        println!("[getdoc] Starting analysis in Comprehensive Mode for multiple feature sets...");
+    }
+
+    let feature_sets_to_check = get_feature_sets_to_check(cli_args.features.as_ref()).unwrap_or_else(|e| {
+        eprintln!("[getdoc] Warning: Could not determine feature sets: {}. Proceeding with a minimal check.", e);
+        // If no context features, then default.
+        if let Some(target_feats) = cli_args.features.as_ref() {
+            if target_feats.is_empty() {
+                 vec![vec![]] // Default if --features ""
+            } else {
+                 vec![vec!["--features".to_string(), target_feats.join(",")]]
+            }
+        } else {
+            vec![vec![]] // Default features if comprehensive mode fails to load Cargo.toml
+        }
     });
 
     let mut all_displayable_diagnostics: Vec<(String, Vec<DisplayableDiagnostic>)> = Vec::new();
@@ -154,7 +188,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    generate_markdown_report(&all_displayable_diagnostics, &extracted_data, &sorted_file_paths, &global_file_referencers)?;
+    // Pass the original context_features from CLI to the report generator for metadata
+    generate_markdown_report(
+        &all_displayable_diagnostics,
+        &extracted_data,
+        &sorted_file_paths,
+        &global_file_referencers,
+        cli_args.features.as_ref(), // Pass as Option<&Vec<String>>
+    )?;
 
     println!("[getdoc] Analysis complete. Report generated: report.md");
     Ok(())
@@ -162,33 +203,102 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // --- Helper Functions ---
 
-fn get_feature_sets_to_check() -> Result<Vec<Vec<String>>, Box<dyn std::error::Error>> {
-    let mut sets = Vec::new();
-    sets.push(vec![]); // Default features
+/// Determines the sets of feature arguments to pass to `cargo check`.
+///
+/// If `context_features` is `Some`, it runs in "Targeted Mode", focusing checks
+/// around the specified features within the current environment.
+/// If `context_features` is `None`, it runs in "Comprehensive Mode", checking
+/// a broader range of default, no-default, all-features, and individual features.
+fn get_feature_sets_to_check(
+    context_features: Option<&Vec<String>>,
+) -> Result<Vec<Vec<String>>, Box<dyn std::error::Error>> {
+    let mut sets: Vec<Vec<String>> = Vec::new();
 
-    let cargo_toml_path = PathBuf::from("Cargo.toml");
-    if !cargo_toml_path.exists() {
-        println!("[getdoc] Warning: Cargo.toml not found in current directory. Only checking with default features.");
-        return Ok(sets);
-    }
+    if let Some(targets) = context_features {
+        // --- Targeted Mode ---
+        // This mode assumes the environment (e.g., RUSTFLAGS, LD_LIBRARY_PATH)
+        // has been pre-configured externally (e.g., by a CI script) for these target features.
+        // The checks are focused on these targets within that environment.
+        println!("[getdoc] Determining feature checks for Targeted Mode (context: {:?})", targets);
 
-    let cargo_toml_content = fs::read_to_string(cargo_toml_path)?;
-    let parsed_toml: CargoToml = toml::from_str(&cargo_toml_content).unwrap_or_default();
+        if targets.is_empty() {
+            // Handles an edge case like `getdoc --features ""` or if logic somehow passes empty vec.
+            // In this scenario, just check the crate's default features in the current environment.
+            println!("[getdoc] Targeted features list is empty. Checking with crate default features only.");
+            sets.push(vec![]); // Represents `cargo check` with no explicit feature flags
+        } else {
+            let features_arg_string = targets.join(",");
 
-    if !parsed_toml.features.is_empty() {
-        sets.push(vec!["--no-default-features".to_string()]);
-        for feature_name in parsed_toml.features.keys() {
-            if feature_name != "default" {
-                sets.push(vec![
-                    "--no-default-features".to_string(),
-                    "--features".to_string(),
-                    feature_name.clone(),
-                ]);
-            }
+            // Set 1: Check with the specified target features.
+            // This implicitly includes the crate's default features unless the target features
+            // themselves disable them or are part of a mutually exclusive set.
+            sets.push(vec!["--features".to_string(), features_arg_string.clone()]);
+
+            // Set 2: Check with the specified target features AND --no-default-features.
+            // This checks the target features in greater isolation from the crate's defaults.
+            sets.push(vec![
+                "--no-default-features".to_string(),
+                "--features".to_string(),
+                features_arg_string.clone(),
+            ]);
+
+            // Set 3: Check with only the crate's default features (no explicit feature flags).
+            // This helps see how the crate's baseline compiles within the current specialized environment.
+            sets.push(vec![]);
         }
-        sets.push(vec!["--all-features".to_string()]);
+    } else {
+        // --- Comprehensive Mode ---
+        // This mode tries to check a variety of feature combinations.
+        println!("[getdoc] Determining feature checks for Comprehensive Mode.");
+        sets.push(vec![]); // Default features
+
+        let cargo_toml_path = PathBuf::from("Cargo.toml");
+        if cargo_toml_path.exists() {
+            match fs::read_to_string(&cargo_toml_path) {
+                Ok(cargo_toml_content) => {
+                    let parsed_toml: CargoToml =
+                        toml::from_str(&cargo_toml_content).unwrap_or_else(|e| {
+                            eprintln!("[getdoc] Warning: Failed to parse Cargo.toml: {}. Assuming no custom features.", e);
+                            CargoToml::default()
+                        });
+
+                    if !parsed_toml.features.is_empty() {
+                        // Add --no-default-features check
+                        sets.push(vec!["--no-default-features".to_string()]);
+
+                        // Add each individual non-default feature with --no-default-features
+                        for feature_name in parsed_toml.features.keys() {
+                            if feature_name != "default" { // "default" is not a feature name to pass to --features
+                                sets.push(vec![
+                                    "--no-default-features".to_string(),
+                                    "--features".to_string(),
+                                    feature_name.clone(),
+                                ]);
+                            }
+                        }
+                        // Add --all-features check
+                        sets.push(vec!["--all-features".to_string()]);
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[getdoc] Warning: Could not read Cargo.toml at {:?}: {}. Proceeding with default features check only.",
+                        cargo_toml_path, e
+                    );
+                    // `sets` already contains the default check from above.
+                }
+            }
+        } else {
+            println!(
+                "[getdoc] Warning: Cargo.toml not found in current directory. Only checking with default features."
+            );
+            // `sets` already contains the default check from above.
+        }
     }
 
+    // Deduplicate the generated sets of feature arguments to avoid redundant `cargo check` runs.
+    // Sorting within each set ensures that sets with the same arguments but different order
+    // are treated as identical for deduplication.
     let mut unique_sets_str: HashSet<String> = HashSet::new();
     let mut unique_sets_vec: Vec<Vec<String>> = Vec::new();
     for set in sets {
@@ -684,10 +794,29 @@ fn generate_markdown_report(
     extracted_data: &HashMap<PathBuf, Vec<ExtractedItem>>,
     sorted_file_paths: &[PathBuf],
     file_referencers: &HashMap<PathBuf, HashSet<DiagnosticOriginInfo>>,
+    context_features: Option<&Vec<String>>, // For adding run mode to report header
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut writer = BufWriter::new(File::create("report.md")?);
+    let mut writer = BufWriter::new(File::create("report.md")?); // Output is always report.md
 
-    writeln!(writer, "# GetDoc Report - {}", Local::now().to_rfc2822())?;
+    // Determine the mode description for the report header
+    let mode_description = match context_features {
+        Some(features_vec) if !features_vec.is_empty() => {
+            format!("Targeted Mode for Features: `{}`", features_vec.join(", "))
+        }
+        Some(_) => {
+            // This case might occur if `getdoc --features ""` was used and handled by get_feature_sets_to_check
+            // by effectively running a default-like check in targeted mode.
+            "Targeted Mode (Context specified, using crate defaults)".to_string()
+        }
+        None => "Comprehensive Mode".to_string(),
+    };
+
+    writeln!(
+        writer,
+        "# GetDoc Report - {} - {}",
+        mode_description,
+        Local::now().to_rfc2822()
+    )?;
 
     writeln!(writer, "\n## Compiler Output (Errors and Warnings)\n")?;
     if all_compiler_diagnostics.is_empty() || all_compiler_diagnostics.iter().all(|(_, diags)| diags.is_empty()) {
