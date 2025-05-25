@@ -32,7 +32,6 @@ struct TopLevelCargoMessage {
 
 #[derive(Deserialize, Debug, Clone)]
 struct RustcDiagnosticData {
-    // `message: String` (raw message) removed; `rendered` is used.
     #[serde(default)]
     code: Option<RustcErrorCode>,
     level: String,
@@ -44,6 +43,7 @@ struct RustcDiagnosticData {
 #[derive(Deserialize, Debug, Clone, Hash, Eq, PartialEq, Ord, PartialOrd)]
 struct RustcErrorCode {
     code: String,
+    explanation: Option<String>, 
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -57,7 +57,7 @@ struct RustcSpan {
 struct DiagnosticOriginInfo {
     level: String,
     code: Option<String>,
-    originating_diagnostic_span_location: String, // file_name:line_start of the primary span of the diagnostic
+    originating_diagnostic_span_location: String,
     feature_set_desc: String,
 }
 
@@ -65,17 +65,19 @@ struct DiagnosticOriginInfo {
 struct DisplayableDiagnostic {
     level: String,
     code: Option<String>,
+    code_explanation: Option<String>, 
     rendered: String,
-    primary_location_of_diagnostic: String, // file_name:line_start of its own primary span
-    implicated_third_party_files_details: Vec<(PathBuf, String)>, // (file_path, "file_name:line" of primary span within it)
+    primary_location_of_diagnostic: String,
+    implicated_third_party_files_details: Vec<(PathBuf, String)>,
 }
 
 #[derive(Debug)]
 struct ExtractedItem {
-    item_kind: String,
+    item_kind: String, // e.g., "Function", "Struct", "Impl Method"
     name: String,
     signature_or_definition: String,
     doc_comments: Vec<String>,
+    is_sub_item: bool,
 }
 
 // --- Main Function ---
@@ -116,6 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 all_displayable_diagnostics.push((feature_desc.clone(), vec![DisplayableDiagnostic {
                     level: "TOOL_ERROR".to_string(),
                     code: None,
+                    code_explanation: None, 
                     rendered: error_message,
                     primary_location_of_diagnostic: "N/A".to_string(),
                     implicated_third_party_files_details: vec![],
@@ -242,7 +245,7 @@ fn run_cargo_check_with_features(
                     }
                 }
             }
-            Err(_e) => { /* Optional: eprintln! for debug */ }
+            Err(_e) => { }
         }
     }
     Ok((displayable_diagnostics, implicated_files_this_run, referencers_this_run))
@@ -260,47 +263,45 @@ fn process_single_diagnostic_data(
     let mut current_diag_implicated_tp_files_details = Vec::new();
     let mut primary_location_of_this_diagnostic: Option<String> = None;
 
-    // First, find the primary location of this diagnostic itself
     for span in &diag_data.spans {
         if span.is_primary {
             let path_obj = PathBuf::from(&span.file_name);
             let display_path = if path_obj.is_absolute() {
                 path_obj.strip_prefix(current_dir).unwrap_or(&path_obj).to_path_buf()
             } else {
-                path_obj.clone() // Relative paths in diagnostics are usually relative to project root
+                path_obj.clone()
             };
             primary_location_of_this_diagnostic = Some(format!("{}:{}", display_path.display(), span.line_start));
-            break; // Take the first primary span
+            break;
         }
     }
-    // Fallback if no primary span
     if primary_location_of_this_diagnostic.is_none() && !diag_data.spans.is_empty() {
         let first_span = &diag_data.spans[0];
         let path_obj = PathBuf::from(&first_span.file_name);
         let display_path = if path_obj.is_absolute() {
-                path_obj.strip_prefix(current_dir).unwrap_or(&path_obj).to_path_buf()
-            } else {
-                path_obj.clone()
-            };
+             path_obj.strip_prefix(current_dir).unwrap_or(&path_obj).to_path_buf()
+        } else {
+            path_obj.clone()
+        };
         primary_location_of_this_diagnostic = Some(format!("{}:{} (non-primary)", display_path.display(), first_span.line_start));
     }
     let final_primary_loc_str = primary_location_of_this_diagnostic.clone().unwrap_or_else(|| "Unknown diagnostic location".to_string());
 
-
-    // Now, identify implicated third-party files and create origin info
     for span in &diag_data.spans {
         let path_obj = PathBuf::from(&span.file_name);
         let absolute_path = if path_obj.is_absolute() { path_obj.clone() } else { current_dir.join(&path_obj) };
 
         if let Ok(canonical_path) = fs::canonicalize(&absolute_path) {
-            if !canonical_path.starts_with(current_dir) { // A third-party file
+            if !canonical_path.starts_with(current_dir) {
                 let is_in_cargo_registry = cargo_home_dir.as_ref().map_or(false, |ch| canonical_path.starts_with(&ch.join("registry").join("src")));
                 let is_in_cargo_git = cargo_home_dir.as_ref().map_or(false, |ch| canonical_path.starts_with(&ch.join("git").join("checkouts")));
 
                 if (is_in_cargo_registry || is_in_cargo_git) && canonical_path.is_file() {
-                    let tp_file_detail = format!("{}:{}", canonical_path.file_name().unwrap_or_default().to_string_lossy(), span.line_start);
-                    if !current_diag_implicated_tp_files_details.iter().any(|(p, _)| p == &canonical_path) { // Avoid duplicate Paths, details might differ
-                        current_diag_implicated_tp_files_details.push((canonical_path.clone(), tp_file_detail));
+                    let tp_file_name = canonical_path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    let tp_file_detail = format!("{}:{}", tp_file_name, span.line_start);
+                    
+                    if !current_diag_implicated_tp_files_details.iter().any(|(p, _)| p == &canonical_path) {
+                         current_diag_implicated_tp_files_details.push((canonical_path.clone(), tp_file_detail));
                     }
                     implicated_files_overall_run.insert(canonical_path.clone());
 
@@ -319,9 +320,13 @@ fn process_single_diagnostic_data(
     if diag_data.level == "error" || diag_data.level == "warning" {
         if let Some(rendered) = &diag_data.rendered {
             if !rendered.trim().is_empty() {
+                let item_code = diag_data.code.as_ref().map(|c| c.code.clone());
+                let item_code_explanation = diag_data.code.as_ref().and_then(|c| c.explanation.clone()); // CAPTURE EXPLANATION
+
                 displayable_diagnostics.push(DisplayableDiagnostic {
                     level: diag_data.level.clone(),
-                    code: diag_data.code.as_ref().map(|c| c.code.clone()),
+                    code: item_code,
+                    code_explanation: item_code_explanation, 
                     rendered: rendered.trim_end().to_string(),
                     implicated_third_party_files_details: current_diag_implicated_tp_files_details,
                     primary_location_of_diagnostic: final_primary_loc_str.clone(),
@@ -349,7 +354,7 @@ fn extract_items_from_file(file_path: &PathBuf) -> Result<Vec<ExtractedItem>, Bo
     let mut items = Vec::new();
 
     for item_syn in ast.items {
-        let docs = match &item_syn {
+        let top_level_docs = match &item_syn { // Renamed for clarity in Impl block
             syn::Item::Fn(i) => extract_doc_comments(&i.attrs),
             syn::Item::Struct(i) => extract_doc_comments(&i.attrs),
             syn::Item::Enum(i) => extract_doc_comments(&i.attrs),
@@ -359,124 +364,290 @@ fn extract_items_from_file(file_path: &PathBuf) -> Result<Vec<ExtractedItem>, Bo
             syn::Item::Type(i) => extract_doc_comments(&i.attrs),
             syn::Item::Const(i) => extract_doc_comments(&i.attrs),
             syn::Item::Static(i) => extract_doc_comments(&i.attrs),
+            syn::Item::Use(i) => extract_doc_comments(&i.attrs),
+            syn::Item::ExternCrate(i) => extract_doc_comments(&i.attrs), // Typically no docs, but check anyway
             _ => Vec::new(),
         };
 
-        let (item_kind_str, name_str, sig_def_str) = match &item_syn {
-            syn::Item::Fn(item_fn) => {
-                let vis_string = item_fn.vis.to_token_stream().to_string();
-                let vis_prefix = if vis_string.is_empty() { "".to_string() } else { format!("{} ", vis_string.trim_end()) };
-                let sig = format!("{}{}", vis_prefix, item_fn.sig.to_token_stream().to_string());
-                ("Function".to_string(), item_fn.sig.ident.to_string(), sig)
-            }
-            syn::Item::Struct(item_struct) => {
-                let vis_string = item_struct.vis.to_token_stream().to_string();
-                let vis_prefix = if vis_string.is_empty() { "".to_string() } else { format!("{} ", vis_string.trim_end()) };
-                let def = format!("{}struct {}{}", vis_prefix, item_struct.ident.to_token_stream().to_string(), item_struct.generics.to_token_stream().to_string());
-                ("Struct".to_string(), item_struct.ident.to_string(), def)
-            }
-            syn::Item::Enum(item_enum) => {
-                let vis_string = item_enum.vis.to_token_stream().to_string();
-                let vis_prefix = if vis_string.is_empty() { "".to_string() } else { format!("{} ", vis_string.trim_end()) };
-                let def = format!("{}enum {}{}", vis_prefix, item_enum.ident.to_token_stream().to_string(), item_enum.generics.to_token_stream().to_string());
-                ("Enum".to_string(), item_enum.ident.to_string(), def)
-            }
-            syn::Item::Trait(item_trait) => {
-                let vis_string = item_trait.vis.to_token_stream().to_string();
-                let vis_prefix = if vis_string.is_empty() { "".to_string() } else { format!("{} ", vis_string.trim_end()) };
-                let def = format!("{}trait {}{}{}",
-                    vis_prefix,
-                    item_trait.ident.to_token_stream().to_string(),
-                    item_trait.generics.params.to_token_stream().to_string(),
-                    item_trait.generics.where_clause.as_ref().map_or("".to_string(), |wc| format!(" {}", wc.to_token_stream().to_string()))
-                );
-                ("Trait".to_string(), item_trait.ident.to_string(), def)
-            }
-            syn::Item::Mod(item_mod) => {
-                if item_mod.content.is_none() && docs.is_empty() { continue; } 
-                let vis_string = item_mod.vis.to_token_stream().to_string();
-                let vis_prefix = if vis_string.is_empty() { "".to_string() } else { format!("{} ", vis_string.trim_end()) };
-                let def = format!("{}mod {}", vis_prefix, item_mod.ident.to_token_stream().to_string());
-                ("Module".to_string(), item_mod.ident.to_string(), def)
-            }
-            syn::Item::Impl(item_impl) => {
-                let mut impl_line_tokens = quote::quote! {};
-                if let Some(defaultness) = &item_impl.defaultness { defaultness.to_tokens(&mut impl_line_tokens); impl_line_tokens.extend(quote::quote! { }); }
-                if let Some(unsafety) = &item_impl.unsafety { unsafety.to_tokens(&mut impl_line_tokens); impl_line_tokens.extend(quote::quote! { }); }
-                impl_line_tokens.extend(quote::quote! { impl });
-                item_impl.generics.params.to_tokens(&mut impl_line_tokens);
-                if !item_impl.generics.params.is_empty() { impl_line_tokens.extend(quote::quote! { }); }
-
-                let mut name_parts: Vec<String> = Vec::new();
-                if let Some((opt_bang, trait_path, _for_keyword)) = &item_impl.trait_ {
-                    if opt_bang.is_some() { impl_line_tokens.extend(quote::quote! { ! }); }
-                    trait_path.to_tokens(&mut impl_line_tokens);
-                    name_parts.push(trait_path.to_token_stream().to_string());
-                    impl_line_tokens.extend(quote::quote! { for });
-                    name_parts.push("for".to_string());
-                    impl_line_tokens.extend(quote::quote! { });
-                }
-                item_impl.self_ty.to_tokens(&mut impl_line_tokens);
-                name_parts.push(item_impl.self_ty.to_token_stream().to_string());
-                
-                if let Some(where_clause) = &item_impl.generics.where_clause {
-                    impl_line_tokens.extend(quote::quote! { });
-                    where_clause.to_tokens(&mut impl_line_tokens);
-                }
-                
-                let name = if item_impl.trait_.is_none() {
-                    item_impl.self_ty.to_token_stream().to_string()
-                } else {
-                    format!("impl {}", name_parts.join(" "))
-                };
-                let item_kind = if item_impl.trait_.is_some() { "Trait Impl Block".to_string() } else { "Inherent Impl Block".to_string() };
-                (item_kind, name, impl_line_tokens.to_string())
-            }
-            syn::Item::Type(item_type) => {
-                if docs.is_empty() { continue; }
-                let vis_string = item_type.vis.to_token_stream().to_string();
-                let vis_prefix = if vis_string.is_empty() { "".to_string() } else { format!("{} ", vis_string.trim_end()) };
-                let def = format!("{}type {}{} = {};",
-                    vis_prefix,
-                    item_type.ident.to_token_stream().to_string(),
-                    item_type.generics.to_token_stream().to_string(),
-                    item_type.ty.to_token_stream().to_string()
-                );
-                ("Type Alias".to_string(), item_type.ident.to_string(), def)
-            }
-            syn::Item::Const(item_const) => {
-                if docs.is_empty() { continue; }
-                let vis_string = item_const.vis.to_token_stream().to_string();
-                let vis_prefix = if vis_string.is_empty() { "".to_string() } else { format!("{} ", vis_string.trim_end()) };
-                let def = format!("{}const {}: {} = ...;",
-                    vis_prefix,
-                    item_const.ident.to_token_stream().to_string(),
-                    item_const.ty.to_token_stream().to_string()
-                );
-                ("Constant".to_string(), item_const.ident.to_string(), def)
-            }
-            syn::Item::Static(item_static) => {
-                if docs.is_empty() { continue; }
-                let vis_string = item_static.vis.to_token_stream().to_string();
-                let vis_prefix = if vis_string.is_empty() { "".to_string() } else { format!("{} ", vis_string.trim_end()) };
-                let def = format!("{}static {}: {} = ...;",
-                    vis_prefix,
-                    item_static.ident.to_token_stream().to_string(),
-                    item_static.ty.to_token_stream().to_string()
-                );
-                ("Static".to_string(), item_static.ident.to_string(), def)
-            }
-            _ => continue,
-        };
-        items.push(ExtractedItem {
-            item_kind: item_kind_str,
-            name: name_str,
-            signature_or_definition: sig_def_str.trim().to_string(),
-            doc_comments: docs,
-        });
+        // Use a block to handle item processing and pushing, to allow `continue` for `Item::Impl`
+        // after it pushes its own items AND its sub-items.
+        process_item_syn(&item_syn, top_level_docs, &mut items);
     }
     Ok(items)
 }
+
+// Helper function to process a single syn::Item and its potential sub-items (for Impl)
+fn process_item_syn(item_syn: &syn::Item, docs: Vec<String>, items: &mut Vec<ExtractedItem>) {
+    match item_syn {
+        syn::Item::Fn(item_fn) => {
+            let vis_string = item_fn.vis.to_token_stream().to_string();
+            let vis_prefix = if vis_string.is_empty() { "".to_string() } else { format!("{} ", vis_string.trim_end()) };
+            let sig = format!("{}{}", vis_prefix, item_fn.sig.to_token_stream().to_string());
+            items.push(ExtractedItem {
+                item_kind: "Function".to_string(),
+                name: item_fn.sig.ident.to_string(),
+                signature_or_definition: sig.trim().to_string(),
+                doc_comments: docs,
+                is_sub_item: false,
+            });
+        }
+        syn::Item::Struct(item_struct) => {
+            let vis_string = item_struct.vis.to_token_stream().to_string();
+            let vis_prefix = if vis_string.is_empty() { "".to_string() } else { format!("{} ", vis_string.trim_end()) };
+            let def = format!("{}struct {}{}", vis_prefix, item_struct.ident.to_token_stream().to_string(), item_struct.generics.to_token_stream().to_string());
+            items.push(ExtractedItem {
+                item_kind: "Struct".to_string(),
+                name: item_struct.ident.to_string(),
+                signature_or_definition: def.trim().to_string(),
+                doc_comments: docs,
+                is_sub_item: false,
+            });
+        }
+        syn::Item::Enum(item_enum) => {
+            let vis_string = item_enum.vis.to_token_stream().to_string();
+            let vis_prefix = if vis_string.is_empty() { "".to_string() } else { format!("{} ", vis_string.trim_end()) };
+            let def = format!("{}enum {}{}", vis_prefix, item_enum.ident.to_token_stream().to_string(), item_enum.generics.to_token_stream().to_string());
+            items.push(ExtractedItem {
+                item_kind: "Enum".to_string(),
+                name: item_enum.ident.to_string(),
+                signature_or_definition: def.trim().to_string(),
+                doc_comments: docs,
+                is_sub_item: false,
+            });
+        }
+        syn::Item::Trait(item_trait) => {
+            let vis_string = item_trait.vis.to_token_stream().to_string();
+            let vis_prefix = if vis_string.is_empty() { "".to_string() } else { format!("{} ", vis_string.trim_end()) };
+            let def = format!("{}trait {}{}{}",
+                vis_prefix,
+                item_trait.ident.to_token_stream().to_string(),
+                item_trait.generics.params.to_token_stream().to_string(),
+                item_trait.generics.where_clause.as_ref().map_or("".to_string(), |wc| format!(" {}", wc.to_token_stream().to_string()))
+            );
+            items.push(ExtractedItem {
+                item_kind: "Trait".to_string(),
+                name: item_trait.ident.to_string(),
+                signature_or_definition: def.trim().to_string(),
+                doc_comments: docs,
+                is_sub_item: false,
+            });
+        }
+        syn::Item::Mod(item_mod) => {
+            if item_mod.content.is_none() && docs.is_empty() { return; }
+            let vis_string = item_mod.vis.to_token_stream().to_string();
+            let vis_prefix = if vis_string.is_empty() { "".to_string() } else { format!("{} ", vis_string.trim_end()) };
+            let mod_name_str = item_mod.ident.to_token_stream().to_string();
+            let def = if item_mod.content.is_some() {
+                format!("{}mod {} {{ /* ... */ }}", vis_prefix, mod_name_str)
+            } else {
+                format!("{}mod {};", vis_prefix, mod_name_str)
+            };
+            items.push(ExtractedItem {
+                item_kind: "Module".to_string(),
+                name: mod_name_str,
+                signature_or_definition: def.trim().to_string(),
+                doc_comments: docs,
+                is_sub_item: false,
+            });
+        }
+        syn::Item::Impl(item_impl) => {
+            // 1. Extract the main impl block itself
+            let mut impl_line_tokens = quote::quote! {};
+            if let Some(defaultness) = &item_impl.defaultness { defaultness.to_tokens(&mut impl_line_tokens); impl_line_tokens.extend(quote::quote! { }); }
+            if let Some(unsafety) = &item_impl.unsafety { unsafety.to_tokens(&mut impl_line_tokens); impl_line_tokens.extend(quote::quote! { }); }
+            impl_line_tokens.extend(quote::quote! { impl });
+            item_impl.generics.params.to_tokens(&mut impl_line_tokens);
+            if !item_impl.generics.params.is_empty() { impl_line_tokens.extend(quote::quote! { }); }
+
+            let mut name_parts: Vec<String> = Vec::new();
+            if let Some((opt_bang, trait_path, _for_keyword)) = &item_impl.trait_ {
+                if opt_bang.is_some() { impl_line_tokens.extend(quote::quote! { ! }); }
+                trait_path.to_tokens(&mut impl_line_tokens);
+                name_parts.push(trait_path.to_token_stream().to_string().replace(' ', ""));
+                impl_line_tokens.extend(quote::quote! { for });
+                name_parts.push("for".to_string());
+                impl_line_tokens.extend(quote::quote! { });
+            }
+            item_impl.self_ty.to_tokens(&mut impl_line_tokens);
+            name_parts.push(item_impl.self_ty.to_token_stream().to_string().replace(' ', ""));
+            
+            if let Some(where_clause) = &item_impl.generics.where_clause {
+                impl_line_tokens.extend(quote::quote! { });
+                where_clause.to_tokens(&mut impl_line_tokens);
+            }
+            
+            let name = if item_impl.trait_.is_none() {
+                item_impl.self_ty.to_token_stream().to_string().replace(' ', "")
+            } else {
+                format!("impl {}", name_parts.join(" "))
+            };
+            let item_kind_str = if item_impl.trait_.is_some() { "Trait Impl Block".to_string() } else { "Inherent Impl Block".to_string() };
+            
+            items.push(ExtractedItem {
+                item_kind: item_kind_str,
+                name,
+                signature_or_definition: impl_line_tokens.to_string().trim().to_string(),
+                doc_comments: docs.clone(), // Docs for the impl block itself
+                is_sub_item: false,
+            });
+
+            // 2. Iterate through items within the impl block
+            for impl_item_syn in &item_impl.items {
+                let sub_docs = extract_doc_comments(match impl_item_syn {
+                    syn::ImplItem::Const(item) => &item.attrs,
+                    syn::ImplItem::Fn(item) => &item.attrs,
+                    syn::ImplItem::Type(item) => &item.attrs,
+                    syn::ImplItem::Macro(item) => &item.attrs,
+                    _ => &[],
+                });
+
+                match impl_item_syn {
+                    syn::ImplItem::Fn(impl_fn) => {
+                        let vis_string = impl_fn.vis.to_token_stream().to_string();
+                        let vis_prefix = if vis_string.is_empty() { "".to_string() } else { format!("{} ", vis_string.trim_end()) };
+                        let sig_def_str = format!("{}{};", vis_prefix, impl_fn.sig.to_token_stream().to_string());
+                        items.push(ExtractedItem {
+                            item_kind: "Impl Method".to_string(),
+                            name: impl_fn.sig.ident.to_string(),
+                            signature_or_definition: sig_def_str.trim().to_string(),
+                            doc_comments: sub_docs,
+                            is_sub_item: true,
+                        });
+                    }
+                    syn::ImplItem::Const(impl_const) => {
+                        let vis_string = impl_const.vis.to_token_stream().to_string();
+                        let vis_prefix = if vis_string.is_empty() { "".to_string() } else { format!("{} ", vis_string.trim_end()) };
+                        let sig_def_str = format!("{}const {}: {} = ...;",
+                            vis_prefix,
+                            impl_const.ident.to_token_stream().to_string(),
+                            impl_const.ty.to_token_stream().to_string()
+                        );
+                        items.push(ExtractedItem {
+                            item_kind: "Impl Associated Constant".to_string(),
+                            name: impl_const.ident.to_string(),
+                            signature_or_definition: sig_def_str.trim().to_string(),
+                            doc_comments: sub_docs,
+                            is_sub_item: true,
+                        });
+                    }
+                    syn::ImplItem::Type(impl_type) => {
+                        let vis_string = impl_type.vis.to_token_stream().to_string();
+                        let vis_prefix = if vis_string.is_empty() { "".to_string() } else { format!("{} ", vis_string.trim_end()) };
+                        let sig_def_str = format!("{}type {}{} = {};",
+                            vis_prefix,
+                            impl_type.ident.to_token_stream().to_string(),
+                            impl_type.generics.to_token_stream().to_string(),
+                            impl_type.ty.to_token_stream().to_string()
+                        );
+                        items.push(ExtractedItem {
+                            item_kind: "Impl Associated Type".to_string(),
+                            name: impl_type.ident.to_string(),
+                            signature_or_definition: sig_def_str.trim().to_string(),
+                            doc_comments: sub_docs,
+                            is_sub_item: true,
+                        });
+                    }
+                    syn::ImplItem::Macro(impl_macro) => {
+                        let sig_def_str = impl_macro.mac.to_token_stream().to_string();
+                        let name = impl_macro.mac.path.segments.last().map_or_else(
+                            || "unknown_macro".to_string(),
+                            |seg| seg.ident.to_string()
+                        );
+                        items.push(ExtractedItem {
+                            item_kind: "Impl Macro Invocation".to_string(),
+                            name,
+                            signature_or_definition: sig_def_str.trim().to_string(),
+                            doc_comments: sub_docs,
+                            is_sub_item: true,
+                        });
+                    }
+                    _ => { /* syn::ImplItem::Verbatim, etc. - skip for now */ }
+                }
+            }
+        }
+        syn::Item::Type(item_type) => { // Relaxed doc comment filtering
+            let vis_string = item_type.vis.to_token_stream().to_string();
+            let vis_prefix = if vis_string.is_empty() { "".to_string() } else { format!("{} ", vis_string.trim_end()) };
+            let def = format!("{}type {}{} = {};",
+                vis_prefix,
+                item_type.ident.to_token_stream().to_string(),
+                item_type.generics.to_token_stream().to_string(),
+                item_type.ty.to_token_stream().to_string()
+            );
+            items.push(ExtractedItem {
+                item_kind: "Type Alias".to_string(),
+                name: item_type.ident.to_string(),
+                signature_or_definition: def.trim().to_string(),
+                doc_comments: docs,
+                is_sub_item: false,
+            });
+        }
+        syn::Item::Const(item_const) => { // Relaxed doc comment filtering
+            let vis_string = item_const.vis.to_token_stream().to_string();
+            let vis_prefix = if vis_string.is_empty() { "".to_string() } else { format!("{} ", vis_string.trim_end()) };
+            let def = format!("{}const {}: {} = ...;", // Value omitted
+                vis_prefix,
+                item_const.ident.to_token_stream().to_string(),
+                item_const.ty.to_token_stream().to_string()
+            );
+            items.push(ExtractedItem {
+                item_kind: "Constant".to_string(),
+                name: item_const.ident.to_string(),
+                signature_or_definition: def.trim().to_string(),
+                doc_comments: docs,
+                is_sub_item: false,
+            });
+        }
+        syn::Item::Static(item_static) => { // Relaxed doc comment filtering
+            let vis_string = item_static.vis.to_token_stream().to_string();
+            let vis_prefix = if vis_string.is_empty() { "".to_string() } else { format!("{} ", vis_string.trim_end()) };
+            let def = format!("{}static {}: {} = ...;", // Value omitted
+                vis_prefix,
+                item_static.ident.to_token_stream().to_string(),
+                item_static.ty.to_token_stream().to_string()
+            );
+            items.push(ExtractedItem {
+                item_kind: "Static".to_string(),
+                name: item_static.ident.to_string(),
+                signature_or_definition: def.trim().to_string(),
+                doc_comments: docs,
+                is_sub_item: false,
+            });
+        }
+        syn::Item::ExternCrate(item_ec) => {
+            let def = item_ec.to_token_stream().to_string();
+            let name = if let Some(rename) = &item_ec.rename {
+                rename.1.to_string()
+            } else {
+                item_ec.ident.to_string()
+            };
+            items.push(ExtractedItem {
+                item_kind: "Extern Crate".to_string(),
+                name,
+                signature_or_definition: def.trim().to_string(),
+                doc_comments: docs, // Usually empty for extern crate
+                is_sub_item: false,
+            });
+        }
+        syn::Item::Use(item_use) => {
+            // Extract if public or has docs. Could be refined with diagnostic span targeting.
+            let is_public = matches!(item_use.vis, syn::Visibility::Public(_));
+            if docs.is_empty() && !is_public { return; } // Only skip if not public AND no docs
+
+            let def = item_use.to_token_stream().to_string();
+            let name = item_use.tree.to_token_stream().to_string();
+            items.push(ExtractedItem {
+                item_kind: "Use Statement".to_string(),
+                name: name.chars().take(70).collect::<String>() + if name.chars().count() > 70 { "..." } else { "" }, // Truncate for sanity
+                signature_or_definition: def.trim().to_string(),
+                doc_comments: docs,
+                is_sub_item: false,
+            });
+        }
+        _ => { /* Other item types are not processed for now or were handled if docs present */ }
+    }
+}
+
 
 fn extract_doc_comments(attrs: &[syn::Attribute]) -> Vec<String> {
     attrs.iter()
@@ -490,12 +661,22 @@ fn extract_doc_comments(attrs: &[syn::Attribute]) -> Vec<String> {
                             }
                         }
                     }
-                    _ => {}
+                    _ => {} // Other meta forms for `doc` are rare or not standard doc comments
                 }
             }
             None
         })
         .collect()
+}
+
+fn item_header_name_logic(item: &ExtractedItem) -> String {
+    if item.item_kind.contains("Impl Block") && item.name.starts_with("impl ") {
+        item.signature_or_definition.split('{').next().unwrap_or(&item.name).trim().to_string()
+    } else if item.item_kind == "Module" && item.name.is_empty() {
+        "Unnamed Module".to_string()
+    } else {
+        item.name.clone()
+    }
 }
 
 fn generate_markdown_report(
@@ -524,6 +705,19 @@ fn generate_markdown_report(
                         ),
                         diag_disp.rendered
                     )?;
+
+                    if let Some(explanation) = &diag_disp.code_explanation {
+                        if !explanation.trim().is_empty() {
+                             // Avoid showing explanation if it's clearly a substring of the rendered message
+                            if !diag_disp.rendered.contains(explanation.lines().next().unwrap_or_default()) {
+                                writeln!(writer, "\n  **Explanation ({})**:\n  > {}",
+                                    diag_disp.code.as_deref().unwrap_or(""),
+                                    explanation.trim().replace('\n', "\n  > ")
+                                )?;
+                            }
+                        }
+                    }
+
                     writeln!(writer, "    (Diagnostic primary location: {})", diag_disp.primary_location_of_diagnostic)?;
                     if !diag_disp.implicated_third_party_files_details.is_empty() {
                         let file_list = diag_disp.implicated_third_party_files_details.iter()
@@ -550,12 +744,21 @@ fn generate_markdown_report(
                         let mut sorted_origins: Vec<_> = origins.iter().collect();
                         sorted_origins.sort();
                         for origin in sorted_origins {
-                            writeln!(writer, "* {} {} (originating at `{}` from configuration: `{}`)",
-                                origin.level.to_uppercase(),
-                                origin.code.as_deref().unwrap_or("N/A"),
-                                origin.originating_diagnostic_span_location, // Changed field name
-                                origin.feature_set_desc
-                            )?;
+                            let level_str = origin.level.to_uppercase();
+                            if level_str == "NOTE" || level_str == "HELP" {
+                                writeln!(writer, "* {} (originating at `{}` from configuration: `{}`)",
+                                    level_str,
+                                    origin.originating_diagnostic_span_location,
+                                    origin.feature_set_desc
+                                )?;
+                            } else {
+                                writeln!(writer, "* {} {} (originating at `{}` from configuration: `{}`)",
+                                    level_str,
+                                    origin.code.as_deref().unwrap_or("N/A"), // Keep N/A for non-notes if code is somehow missing
+                                    origin.originating_diagnostic_span_location,
+                                    origin.feature_set_desc
+                                )?;
+                            }
                         }
                         writeln!(writer)?;
                     }
@@ -565,15 +768,22 @@ fn generate_markdown_report(
                     writeln!(writer, "_No extractable items (functions, structs, etc. meeting criteria) found or processed in this file._\n")?;
                     continue;
                 }
+                
+                let mut in_impl_block_context = false; // Used to determine H3 vs H4
                 for item in items {
-                    let item_header_name = if item.item_kind.contains("Impl Block") && item.name.starts_with("impl ") {
-                         item.signature_or_definition.split('{').next().unwrap_or(&item.name).trim()
-                    } else if item.item_kind == "Module" && item.name.is_empty() {
-                        "Unnamed Module"
-                    } else {
-                        &item.name
-                    };
-                    writeln!(writer, "### {} `{}`\n", item.item_kind, item_header_name)?;
+                    let item_display_name = item_header_name_logic(item);
+
+                    if item.item_kind.contains("Impl Block") && !item.is_sub_item {
+                        in_impl_block_context = true;
+                        writeln!(writer, "### {} `{}`\n", item.item_kind, item_display_name)?;
+                    } else if item.is_sub_item {
+                        // If not in_impl_block_context, it's an error in logic or data, print as H3 to be safe.
+                        let heading = if in_impl_block_context { "####" } else { "### (Sub-item without Impl context)" };
+                        writeln!(writer, "{} {} `{}`\n", heading, item.item_kind, item.name)?; // Use item.name for sub-items directly
+                    } else { // Top-level item, not an impl block that contains others
+                        in_impl_block_context = false;
+                        writeln!(writer, "### {} `{}`\n", item.item_kind, item_display_name)?;
+                    }
 
                     if !item.doc_comments.is_empty() {
                         for doc_line in &item.doc_comments {
