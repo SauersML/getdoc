@@ -1,6 +1,6 @@
-# GetDoc: Rust Error Contextualizer
+# `getdoc`: Rust Error Contextualizer
 
-GetDoc is a developer tool for Rust projects designed to improve the debugging process by providing relevant source code context directly alongside compiler errors and warnings, especially those originating from or implicating third-party crates.
+`getdoc` is a developer tool for Rust projects designed to improve the debugging process by providing relevant source code context directly alongside compiler errors and warnings, especially those originating from or implicating third-party crates.
 
 ## Problem Solved
 
