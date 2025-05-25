@@ -32,7 +32,7 @@ struct TopLevelCargoMessage {
 
 #[derive(Deserialize, Debug, Clone)]
 struct RustcDiagnosticData {
-    // `message: String` (raw message) removed as `rendered` is used for output.
+    // `message: String` (raw message) removed; `rendered` is used.
     #[serde(default)]
     code: Option<RustcErrorCode>,
     level: String,
@@ -49,15 +49,15 @@ struct RustcErrorCode {
 #[derive(Deserialize, Debug, Clone)]
 struct RustcSpan {
     file_name: String,
-    is_primary: bool, // Needed for linking
-    line_start: usize,  // Needed for linking
+    is_primary: bool,
+    line_start: usize,
 }
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Ord, PartialOrd)]
 struct DiagnosticOriginInfo {
     level: String,
     code: Option<String>,
-    location_in_user_code: String, // e.g., "src/main.rs:12"
+    originating_diagnostic_span_location: String, // file_name:line_start of the primary span of the diagnostic
     feature_set_desc: String,
 }
 
@@ -66,8 +66,8 @@ struct DisplayableDiagnostic {
     level: String,
     code: Option<String>,
     rendered: String,
-    implicated_third_party_files: Vec<PathBuf>,
-    primary_user_code_location: Option<String>,
+    primary_location_of_diagnostic: String, // file_name:line_start of its own primary span
+    implicated_third_party_files_details: Vec<(PathBuf, String)>, // (file_path, "file_name:line" of primary span within it)
 }
 
 #[derive(Debug)]
@@ -117,8 +117,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     level: "TOOL_ERROR".to_string(),
                     code: None,
                     rendered: error_message,
-                    implicated_third_party_files: vec![],
-                    primary_user_code_location: None,
+                    primary_location_of_diagnostic: "N/A".to_string(),
+                    implicated_third_party_files_details: vec![],
                 }]));
             }
         }
@@ -175,7 +175,7 @@ fn get_feature_sets_to_check() -> Result<Vec<Vec<String>>, Box<dyn std::error::E
     if !parsed_toml.features.is_empty() {
         sets.push(vec!["--no-default-features".to_string()]);
         for feature_name in parsed_toml.features.keys() {
-            if feature_name != "default" { // Avoid redundant check if "default" is explicitly listed
+            if feature_name != "default" {
                 sets.push(vec![
                     "--no-default-features".to_string(),
                     "--features".to_string(),
@@ -190,10 +190,10 @@ fn get_feature_sets_to_check() -> Result<Vec<Vec<String>>, Box<dyn std::error::E
     let mut unique_sets_vec: Vec<Vec<String>> = Vec::new();
     for set in sets {
         let mut sorted_set_for_key = set.clone();
-        sorted_set_for_key.sort(); // Sort for consistent key representation
+        sorted_set_for_key.sort();
         let set_key = sorted_set_for_key.join(" ");
         if unique_sets_str.insert(set_key) {
-            unique_sets_vec.push(set); // Add original (unsorted) set
+            unique_sets_vec.push(set);
         }
     }
     Ok(unique_sets_vec)
@@ -207,10 +207,7 @@ fn run_cargo_check_with_features(
     command.arg("check").arg("--message-format=json");
     command.args(feature_args);
 
-    let cargo_output = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
+    let cargo_output = command.stdout(Stdio::piped()).stderr(Stdio::piped()).output()?;
 
     if !cargo_output.stderr.is_empty() {
         let stderr_text = String::from_utf8_lossy(&cargo_output.stderr);
@@ -228,14 +225,12 @@ fn run_cargo_check_with_features(
     let stdout_str = String::from_utf8_lossy(&cargo_output.stdout);
 
     for line in stdout_str.lines() {
-        if line.trim().is_empty() || !line.starts_with('{') {
-            continue;
-        }
+        if line.trim().is_empty() || !line.starts_with('{') { continue; }
         match serde_json::from_str::<TopLevelCargoMessage>(line) {
             Ok(top_level_msg) => {
                 if top_level_msg.reason == "compiler-message" {
                     if let Some(diag_data) = top_level_msg.message {
-                        process_diagnostic_data(
+                        process_single_diagnostic_data(
                             &diag_data,
                             &mut displayable_diagnostics,
                             &mut implicated_files_this_run,
@@ -243,70 +238,79 @@ fn run_cargo_check_with_features(
                             &current_dir,
                             &cargo_home_dir,
                             feature_desc,
-                            None, // No parent primary location for top-level diags
                         );
                     }
                 }
             }
-            Err(_e) => { /* eprintln!("[getdoc] Debug: Skipping non-compiler-message or unparsable line: {} (Line: '{}')", e, line); */ }
+            Err(_e) => { /* Optional: eprintln! for debug */ }
         }
     }
     Ok((displayable_diagnostics, implicated_files_this_run, referencers_this_run))
 }
 
-fn process_diagnostic_data(
+fn process_single_diagnostic_data(
     diag_data: &RustcDiagnosticData,
     displayable_diagnostics: &mut Vec<DisplayableDiagnostic>,
-    implicated_files_this_run: &mut HashSet<PathBuf>,
-    referencers_this_run: &mut HashMap<PathBuf, HashSet<DiagnosticOriginInfo>>,
+    implicated_files_overall_run: &mut HashSet<PathBuf>,
+    referencers_for_run: &mut HashMap<PathBuf, HashSet<DiagnosticOriginInfo>>,
     current_dir: &Path,
     cargo_home_dir: &Option<PathBuf>,
     feature_desc: &str,
-    inherited_primary_user_loc: Option<&str>, // For children diagnostics
 ) {
-    let mut current_diag_implicated_tp_files = Vec::new();
-    let mut primary_user_code_location_for_this_diag: Option<String> = inherited_primary_user_loc.map(String::from);
+    let mut current_diag_implicated_tp_files_details = Vec::new();
+    let mut primary_location_of_this_diagnostic: Option<String> = None;
 
+    // First, find the primary location of this diagnostic itself
+    for span in &diag_data.spans {
+        if span.is_primary {
+            let path_obj = PathBuf::from(&span.file_name);
+            let display_path = if path_obj.is_absolute() {
+                path_obj.strip_prefix(current_dir).unwrap_or(&path_obj).to_path_buf()
+            } else {
+                path_obj.clone() // Relative paths in diagnostics are usually relative to project root
+            };
+            primary_location_of_this_diagnostic = Some(format!("{}:{}", display_path.display(), span.line_start));
+            break; // Take the first primary span
+        }
+    }
+    // Fallback if no primary span
+    if primary_location_of_this_diagnostic.is_none() && !diag_data.spans.is_empty() {
+        let first_span = &diag_data.spans[0];
+        let path_obj = PathBuf::from(&first_span.file_name);
+        let display_path = if path_obj.is_absolute() {
+                path_obj.strip_prefix(current_dir).unwrap_or(&path_obj).to_path_buf()
+            } else {
+                path_obj.clone()
+            };
+        primary_location_of_this_diagnostic = Some(format!("{}:{} (non-primary)", display_path.display(), first_span.line_start));
+    }
+    let final_primary_loc_str = primary_location_of_this_diagnostic.clone().unwrap_or_else(|| "Unknown diagnostic location".to_string());
+
+
+    // Now, identify implicated third-party files and create origin info
     for span in &diag_data.spans {
         let path_obj = PathBuf::from(&span.file_name);
-        // Try to make it absolute if it's relative, using current_dir as base
-        let absolute_path = if path_obj.is_absolute() {
-            path_obj.clone()
-        } else {
-            current_dir.join(&path_obj)
-        };
+        let absolute_path = if path_obj.is_absolute() { path_obj.clone() } else { current_dir.join(&path_obj) };
 
         if let Ok(canonical_path) = fs::canonicalize(&absolute_path) {
-            if span.is_primary && canonical_path.starts_with(current_dir) {
-                // This is a primary span in user's code
-                if primary_user_code_location_for_this_diag.is_none() { // Prefer top-most primary span
-                     let display_path = canonical_path.strip_prefix(current_dir).unwrap_or(&canonical_path);
-                     primary_user_code_location_for_this_diag = Some(format!("{}:{}", display_path.display(), span.line_start));
-                }
-            }
-
             if !canonical_path.starts_with(current_dir) { // A third-party file
                 let is_in_cargo_registry = cargo_home_dir.as_ref().map_or(false, |ch| canonical_path.starts_with(&ch.join("registry").join("src")));
                 let is_in_cargo_git = cargo_home_dir.as_ref().map_or(false, |ch| canonical_path.starts_with(&ch.join("git").join("checkouts")));
 
                 if (is_in_cargo_registry || is_in_cargo_git) && canonical_path.is_file() {
-                    if !current_diag_implicated_tp_files.contains(&canonical_path) {
-                        current_diag_implicated_tp_files.push(canonical_path.clone());
+                    let tp_file_detail = format!("{}:{}", canonical_path.file_name().unwrap_or_default().to_string_lossy(), span.line_start);
+                    if !current_diag_implicated_tp_files_details.iter().any(|(p, _)| p == &canonical_path) { // Avoid duplicate Paths, details might differ
+                        current_diag_implicated_tp_files_details.push((canonical_path.clone(), tp_file_detail));
                     }
-                    implicated_files_this_run.insert(canonical_path.clone());
-
-                    // Use the determined primary user code location for this diagnostic, or fallback
-                    let user_loc_for_origin = primary_user_code_location_for_this_diag.clone()
-                        .unwrap_or_else(|| inherited_primary_user_loc.map(String::from)
-                        .unwrap_or_else(|| "Unknown source (check diagnostic spans)".to_string()));
+                    implicated_files_overall_run.insert(canonical_path.clone());
 
                     let origin_info = DiagnosticOriginInfo {
                         level: diag_data.level.clone(),
                         code: diag_data.code.as_ref().map(|c| c.code.clone()),
-                        location_in_user_code: user_loc_for_origin,
+                        originating_diagnostic_span_location: final_primary_loc_str.clone(),
                         feature_set_desc: feature_desc.to_string(),
                     };
-                    referencers_this_run.entry(canonical_path).or_default().insert(origin_info);
+                    referencers_for_run.entry(canonical_path).or_default().insert(origin_info);
                 }
             }
         }
@@ -319,27 +323,25 @@ fn process_diagnostic_data(
                     level: diag_data.level.clone(),
                     code: diag_data.code.as_ref().map(|c| c.code.clone()),
                     rendered: rendered.trim_end().to_string(),
-                    implicated_third_party_files: current_diag_implicated_tp_files,
-                    primary_user_code_location: primary_user_code_location_for_this_diag.clone(),
+                    implicated_third_party_files_details: current_diag_implicated_tp_files_details,
+                    primary_location_of_diagnostic: final_primary_loc_str.clone(),
                 });
             }
         }
     }
 
     for child in &diag_data.children {
-        process_diagnostic_data(
+        process_single_diagnostic_data(
             child,
-            displayable_diagnostics, // Children might add to this if they are errors/warnings with rendered text
-            implicated_files_this_run,
-            referencers_this_run,
+            displayable_diagnostics,
+            implicated_files_overall_run,
+            referencers_for_run,
             current_dir,
             cargo_home_dir,
             feature_desc,
-            primary_user_code_location_for_this_diag.as_deref(), // Pass down the parent's primary location
         );
     }
 }
-
 
 fn extract_items_from_file(file_path: &PathBuf) -> Result<Vec<ExtractedItem>, Box<dyn std::error::Error>> {
     let content = fs::read_to_string(file_path)?;
@@ -385,7 +387,7 @@ fn extract_items_from_file(file_path: &PathBuf) -> Result<Vec<ExtractedItem>, Bo
                 let def = format!("{}trait {}{}{}",
                     vis_prefix,
                     item_trait.ident.to_token_stream().to_string(),
-                    item_trait.generics.params.to_token_stream().to_string(), // Only params for trait name
+                    item_trait.generics.params.to_token_stream().to_string(),
                     item_trait.generics.where_clause.as_ref().map_or("".to_string(), |wc| format!(" {}", wc.to_token_stream().to_string()))
                 );
                 ("Trait".to_string(), item_trait.ident.to_string(), def)
@@ -512,7 +514,7 @@ fn generate_markdown_report(
     } else {
         for (feature_desc, diagnostics) in all_compiler_diagnostics {
             if !diagnostics.is_empty() {
-                writeln!(writer, "### Diagnostics for: {}\n", feature_desc)?; // Cleaned header
+                writeln!(writer, "### Diagnostics for: {}\n", feature_desc)?;
                 writeln!(writer, "```text")?;
                 for diag_disp in diagnostics {
                     writeln!(writer, "{}{}",
@@ -522,15 +524,12 @@ fn generate_markdown_report(
                         ),
                         diag_disp.rendered
                     )?;
-                    if !diag_disp.implicated_third_party_files.is_empty() {
-                        let file_list = diag_disp.implicated_third_party_files.iter()
-                            .map(|p| format!("`{}`", p.file_name().unwrap_or_default().to_string_lossy()))
+                    writeln!(writer, "    (Diagnostic primary location: {})", diag_disp.primary_location_of_diagnostic)?;
+                    if !diag_disp.implicated_third_party_files_details.is_empty() {
+                        let file_list = diag_disp.implicated_third_party_files_details.iter()
+                            .map(|(p, detail_loc)| format!("`{}` (at `{}`)", p.file_name().unwrap_or_default().to_string_lossy(), detail_loc))
                             .collect::<Vec<String>>().join(", ");
-                        if let Some(user_loc) = &diag_disp.primary_user_code_location {
-                             writeln!(writer, "    (from {} -> Implicates: {})", user_loc, file_list)?;
-                        } else {
-                             writeln!(writer, "    (Implicates: {})", file_list)?;
-                        }
+                        writeln!(writer, "    (Implicates: {} - see details below if extracted)", file_list)?;
                     }
                 }
                 writeln!(writer, "```\n")?;
@@ -551,10 +550,10 @@ fn generate_markdown_report(
                         let mut sorted_origins: Vec<_> = origins.iter().collect();
                         sorted_origins.sort();
                         for origin in sorted_origins {
-                            writeln!(writer, "* {} {} (in `{}` from configuration: `{}`)",
+                            writeln!(writer, "* {} {} (originating at `{}` from configuration: `{}`)",
                                 origin.level.to_uppercase(),
                                 origin.code.as_deref().unwrap_or("N/A"),
-                                origin.location_in_user_code,
+                                origin.originating_diagnostic_span_location, // Changed field name
                                 origin.feature_set_desc
                             )?;
                         }
