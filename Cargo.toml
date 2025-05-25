@@ -2,6 +2,12 @@
 name = "getdoc"
 version = "0.1.0"
 edition = "2024"
+authors = ["SauersML"]
+description = "Get information related to compiler errors."
+license = "MIT"
+repository = "https://github.com/SauersML/getdoc"
+readme = "README.md"
+documentation = "https://github.com/SauersML/getdoc"
 
 [dependencies]
 chrono = { version = "0.4.41", features = ["clock"] }
