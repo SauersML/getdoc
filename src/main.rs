@@ -372,12 +372,26 @@ fn get_feature_sets_to_check(
             sets.push(vec![]);
         } else {
             let features_arg_string = targets.join(",");
-            sets.push(vec!["--features".to_string(), features_arg_string.clone()]);
+            // Always check the targeted feature(s) with --no-default-features for the project.
             sets.push(vec![
                 "--no-default-features".to_string(),
                 "--features".to_string(),
                 features_arg_string.clone(),
             ]);
+
+            // If more than one feature is specified by the user (e.g., "feat1,feat2"),
+            // then also check their combination together WITH the project's default features.
+            if targets.len() > 1 {
+                println!("[getdoc] Multiple features targeted ('{}'): also checking their combination with project default features.", features_arg_string);
+                sets.push(vec!["--features".to_string(), features_arg_string.clone()]);
+            } else {
+                // If only a SINGLE feature is targeted (e.g., `getdoc --features backend_mkl`),
+                // skip the check that combines this single targeted feature
+                // WITH the project's default features.
+                println!("[getdoc] Single feature targeted ('{}'): skipping check that combines it with project default features to avoid potential conflicts. It is already checked with --no-default-features.", features_arg_string);
+            }
+
+            // Always check the project's default features independently.
             sets.push(vec![]);
         }
     } else {
